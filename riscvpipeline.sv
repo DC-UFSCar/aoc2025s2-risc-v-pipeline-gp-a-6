@@ -21,10 +21,10 @@ module riscvpipeline (
    function isSYSTEM; input [31:0] I; isSYSTEM=(I[6:0]==7'b1110011); endfunction
 
    /* Register indices */
-   function [4:0] rs1Id; input [31:0] I; rs1Id = I[19:15];      endfunction
-   function [4:0] rs2Id; input [31:0] I; rs2Id = I[24:20];      endfunction
-   function [4:0] shamt; input [31:0] I; shamt = I[24:20];      endfunction
-   function [4:0] rdId;  input [31:0] I; rdId  = I[11:7];       endfunction
+   function [4:0] rs1Id; input [31:0] I; rs1Id = I[19:15]; endfunction
+   function [4:0] rs2Id; input [31:0] I; rs2Id = I[24:20]; endfunction
+   function [4:0] shamt; input [31:0] I; shamt = I[24:20]; endfunction
+   function [4:0] rdId;  input [31:0] I; rdId  = I[11:7];  endfunction
    function [1:0] csrId; input [31:0] I; csrId = {I[27],I[21]}; endfunction
 
    /* funct3 and funct7 */
@@ -46,27 +46,44 @@ module riscvpipeline (
    function readsRs1; input [31:0] I; readsRs1 = !(isJAL(I) || isAUIPC(I) || isLUI(I)); endfunction
    function readsRs2; input [31:0] I; readsRs2 = isALUreg(I) || isBranch(I) || isStore(I); endfunction
 
-/**********************  F: Instruction fetch *********************************/
+/********************** F: Instruction fetch *********************************/
    localparam NOP = 32'b0000000_00000_00000_000_00000_0110011;
    reg [31:0] F_PC;
    reg [31:0] FD_PC;
    reg [31:0] FD_instr;
    reg        FD_nop;
    assign PC = F_PC;
-
-   /** These two signals come from the Execute stage **/
+   
+   /** These signals come from the Execute stage **/
    wire [31:0] jumpOrBranchAddress;
    wire        jumpOrBranch;
 
+   //Sinal de Stall detectado no estágio de Decode/Execute
+   wire stall; 
+
    always @(posedge clk) begin
-      FD_instr <= Instr;
-      FD_PC    <= F_PC;
-      F_PC     <= F_PC + 4;
-      if (jumpOrBranch)
-    	   F_PC     <= jumpOrBranchAddress;
-      FD_nop <= reset;
-      if (reset)
-    	   F_PC <= 0;
+      //Lógica de Stall e Flush no Fetch
+      // Se houver Stall, não atualiz o PC nem o registrador FD 
+      // Se houver Jump/Branch, atualiza PC para o destino
+      if (reset) begin
+           F_PC <= 0;
+           FD_instr <= NOP;
+           FD_PC <= 0;
+           FD_nop <= 1;
+      end else begin 
+          if (jumpOrBranch) begin
+               F_PC <= jumpOrBranchAddress;
+               // Flush: Quando salta, invalida a instrução 
+               FD_instr <= NOP; 
+               FD_nop <= 1;
+          end else if (!stall) begin
+               F_PC <= F_PC + 4;
+               FD_instr <= Instr;
+               FD_PC <= F_PC;
+               FD_nop <= 0;
+          end
+       
+      end
    end
 
 /************************ D: Instruction decode *******************************/
@@ -74,19 +91,45 @@ module riscvpipeline (
    reg [31:0] DE_instr;
    reg [31:0] DE_rs1;
    reg [31:0] DE_rs2;
-
+   
    /* These three signals come from the Writeback stage */
    wire        writeBackEn;
    wire [31:0] writeBackData;
    wire [4:0]  wbRdId;
 
    reg [31:0] RegisterBank [0:31];
+
+   // SOLUÇÃO: Hazard Detection Unit (Stall para Load-Use)
+  assign stall = isLoad(DE_instr) && (
+                  (readsRs1(FD_instr) && rs1Id(FD_instr) == rdId(DE_instr) && rdId(DE_instr) != 0) ||
+                  (readsRs2(FD_instr) && rs2Id(FD_instr) == rdId(DE_instr) && rdId(DE_instr) != 0)
+                  );
+
    always @(posedge clk) begin
-      DE_PC    <= FD_PC;
-      DE_instr <= FD_nop ? NOP : FD_instr;
-      DE_rs1 <= rs1Id(FD_instr) ? RegisterBank[rs1Id(FD_instr)] : 32'b0;
-      DE_rs2 <= rs2Id(FD_instr) ? RegisterBank[rs2Id(FD_instr)] : 32'b0;
-      if (writeBackEn)
+      if (reset || jumpOrBranch || stall) begin 
+          //Flush (devido a branch) ou Stall (inserindo bolha)
+          // Se Jump: inserimos NOP
+          // Se Stall: a instrução em FD fica parada, e inserimos NOP para o estágio EX
+          DE_instr <= NOP;
+          // O resto não importa muito se é NOP, mas zeramos por segurança
+          DE_PC <= 0;
+          DE_rs1 <= 0;
+          DE_rs2 <= 0;
+      end else begin
+          DE_PC    <= FD_PC;
+          DE_instr <= FD_nop ? NOP : FD_instr;
+
+          // Register Bank Forwarding (Write-Read no mesmo ciclo)
+          DE_rs1 <= (writeBackEn && wbRdId != 0 && wbRdId == rs1Id(FD_instr)) ? 
+                     writeBackData : 
+                     (rs1Id(FD_instr) ? RegisterBank[rs1Id(FD_instr)] : 32'b0);
+
+          DE_rs2 <= (writeBackEn && wbRdId != 0 && wbRdId == rs2Id(FD_instr)) ? 
+                     writeBackData : 
+                     (rs2Id(FD_instr) ? RegisterBank[rs2Id(FD_instr)] : 32'b0);
+      end
+      
+      if (writeBackEn && wbRdId != 0)
 	      RegisterBank[wbRdId] <= writeBackData;
    end
 
@@ -96,12 +139,47 @@ module riscvpipeline (
    reg [31:0] EM_rs2;
    reg [31:0] EM_Eresult;
    reg [31:0] EM_addr;
-   wire [31:0] E_aluIn1 = DE_rs1;
-   wire [31:0] E_aluIn2 = isALUreg(DE_instr) | isBranch(DE_instr) ? DE_rs2 : Iimm(DE_instr);
-   wire [4:0]  E_shamt  = isALUreg(DE_instr) ? DE_rs2[4:0] : shamt(DE_instr);
+
+   //Forwarding Unit
+   // Detecta se os operandos necessários em EX estão sendo produzidos em MEM ou WB
+   
+   // Variaveis auxiliares para Forwarding
+   wire [4:0] rs1E = rs1Id(DE_instr);
+   wire [4:0] rs2E = rs2Id(DE_instr);
+   wire [4:0] rdM  = rdId(EM_instr);
+   wire [4:0] rdW  = rdId(MW_instr); 
+   
+   wire regWriteM = writesRd(EM_instr) && (rdM != 0);
+   wire regWriteW = writesRd(MW_instr) && (rdW != 0);
+
+   wire [1:0] ForwardA = (regWriteM && (rdM == rs1E)) ? 2'b10 :
+                         (regWriteW && (rdW == rs1E)) ? 2'b01 : 
+                         2'b00;
+
+   wire [1:0] ForwardB = (regWriteM && (rdM == rs2E)) ? 2'b10 :
+                         (regWriteW && (rdW == rs2E)) ? 2'b01 :
+                         2'b00;
+
+   //MUX para selecionar entrada da ALU (Forwarding)
+   // Dados vindos do estágio MEM (EM_Eresult) ou WB (writeBackData)
+   wire [31:0] E_aluIn1_raw = DE_rs1;
+   wire [31:0] E_aluIn1 = (ForwardA == 2'b10) ? EM_Eresult :
+                          (ForwardA == 2'b01) ? writeBackData : 
+                          E_aluIn1_raw;
+
+   wire [31:0] E_aluIn2_raw_reg = (ForwardB == 2'b10) ? EM_Eresult :
+                                  (ForwardB == 2'b01) ? writeBackData :
+                                  DE_rs2;
+
+   wire [31:0] E_aluIn2 = isALUreg(DE_instr) | isBranch(DE_instr) ? E_aluIn2_raw_reg : Iimm(DE_instr);
+
+   wire [31:0] E_rs2_for_store = E_aluIn2_raw_reg;
+
+   wire [4:0]  E_shamt  = isALUreg(DE_instr) ? E_aluIn2_raw_reg[4:0] : shamt(DE_instr); 
+
    wire E_minus = DE_instr[30] & isALUreg(DE_instr);
    wire E_arith_shift = DE_instr[30];
-
+   
    // The adder is used by both arithmetic instructions and JALR.
    wire [31:0] E_aluPlus = E_aluIn1 + E_aluIn2;
 
@@ -112,8 +190,7 @@ module riscvpipeline (
    wire        E_LTU = E_aluMinus[32];
    wire        E_EQ  = (E_aluMinus[31:0] == 0);
 
-   // Flip a 32 bit word. Used by the shifter (a single shifter for
-   // left and right shifts, saves silicium !)
+   // Flip a 32 bit word. Used by the shifter
    function [31:0] flip32;
       input [31:0] x;
       flip32 = {x[ 0], x[ 1], x[ 2], x[ 3], x[ 4], x[ 5], x[ 6], x[ 7],
@@ -172,12 +249,13 @@ module riscvpipeline (
                                           E_aluOut               ;
 
    always @(posedge clk) begin
+
       EM_PC      <= DE_PC;
       EM_instr   <= DE_instr;
-      EM_rs2     <= DE_rs2;
+      EM_rs2     <= E_rs2_for_store; // SOLUÇÃO: Usar o valor forwardado para Store
       EM_Eresult <= E_result;
-      EM_addr    <= isStore(DE_instr) ? DE_rs1 + Simm(DE_instr) :
-                                        DE_rs1 + Iimm(DE_instr) ;
+      EM_addr    <= isStore(DE_instr) ? E_aluIn1 + Simm(DE_instr) : // SOLUÇÃO: Usar E_aluIn1 (forwardado)
+                                        E_aluIn1 + Iimm(DE_instr) ;
    end
 
 /************************ M: Memory *******************************************/
@@ -223,7 +301,7 @@ module riscvpipeline (
    assign jumpOrBranchAddress = E_JumpOrBranchAddr;
    assign jumpOrBranch        = E_JumpOrBranch;
 
-/******************************************************************************/
+   /******************************************************************************/
 
    always @(posedge clk) begin
       if (halt) begin
